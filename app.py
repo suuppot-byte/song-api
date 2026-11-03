@@ -3,14 +3,12 @@ import time
 import urllib.parse
 import requests
 import yt_dlp
-from curl_cffi import requests as cffi_requests  # pip install curl_cffi
+from curl_cffi import requests as cffi_requests
 from flask import Flask, request, jsonify
-from sc_player import sc_player_resolve
 
 app = Flask(__name__)
 
 LOADER = "https://loader.to"
-# لا تضع User-Agent هنا: impersonate يضبطه تلقائياً
 LOADER_HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Origin": LOADER,
@@ -69,7 +67,7 @@ def url_is_valid(url):
         return False
 
 
-# ---------- المشغل 1: loader.to ----------
+# ---------- المشغل: loader.to ----------
 def player_loader(q):
     yt_url = get_youtube_url(q)
     if not yt_url:
@@ -107,14 +105,16 @@ def player_loader(q):
                 }, None
     return None, "loader: timeout"
 
-# ---- أكمل باقي كودك من هنا (باقي المشغلات والـ routes) ----
+
+# ---------- المسارات ----------
 @app.route("/")
 def home():
     return "OK"
 
 
+@app.route("/api/song")
 @app.route("/play")
-def play():
+def song():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"ok": False, "error": "missing q"}), 400
