@@ -1,11 +1,22 @@
-import re
 import urllib.parse
 import requests
-import yt_dlp
 from flask import Flask, request, jsonify
+from sc_player import sc_player_resolve
 
 app = Flask(__name__)
-UA = {"User-Agent": "Mozilla/5.0"}
+
+
+def player_soundcloud(q):
+    res = sc_player_resolve(q)
+    if res.get("error"):
+        return None, res["error"]
+    return {
+        "title": res["title"],
+        "url": res["audio_url"],
+        "duration": res["duration"],
+        "track_url": res.get("track_url", ""),
+        "source": "SoundCloud",
+    }, None
 
 
 def player_tiktok(q):
@@ -26,57 +37,6 @@ def player_tiktok(q):
         "author": d.get("author", ""),
         "source": "TikTok",
     }, None
-
-
-def sc_search(q):
-    if q.startswith("http") and "soundcloud.com" in q:
-        return q
-    r = requests.get("https://m.soundcloud.com/search",
-                     params={"q": q}, headers=UA, timeout=10)
-    urls = re.findall(r'data-testid="cell-entity-link" href="([^"]+)', r.text)
-    return "https://soundcloud.com" + urls[0] if urls else None
-
-
-def sc_pick_direct(formats):
-    pref = {"mp3": 0, "m4a": 1, "aac": 2, "ogg": 3, "opus": 4}
-    best = None
-    for f in formats:
-        u = f.get("url") or ""
-        if (not u or ".m3u8" in u or ".mpd" in u
-                or f.get("ext") not in pref
-                or "preview" in ((f.get("format_id") or "") + u).lower()
-                or f.get("protocol") not in (None, "http", "https")):
-            continue
-        if best is None or pref[f["ext"]] < pref[best["ext"]]:
-            best = f
-    return best["url"] if best else None
-
-
-def player_soundcloud(q):
-    opts = {"quiet": True, "no_warnings": True,
-            "skip_download": True, "socket_timeout": 10}
-    infos = []
-    try:
-        url = sc_search(q)
-        if url:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                infos.append(ydl.extract_info(url, download=False))
-    except Exception:
-        pass
-    if not infos:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            res = ydl.extract_info(f"scsearch3:{q}", download=False)
-        infos = [e for e in (res or {}).get("entries") or [] if e]
-    for info in infos:
-        direct = sc_pick_direct(info.get("formats") or [])
-        if direct:
-            return {
-                "title": info.get("title", "Unknown"),
-                "url": direct,
-                "duration": int(info.get("duration") or 0),
-                "source": "SoundCloud",
-            }, None
-    return None, "no direct audio found"
 
 
 PLAYERS = [("SoundCloud", player_soundcloud), ("TikTok", player_tiktok)]
