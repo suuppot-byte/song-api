@@ -5,6 +5,7 @@ import requests
 import yt_dlp
 from curl_cffi import requests as cffi_requests
 from flask import Flask, request, jsonify
+from sc_player import sc_player_resolve
 
 app = Flask(__name__)
 
@@ -15,7 +16,7 @@ LOADER_HEADERS = {
     "Referer": LOADER + "/",
     "X-Requested-With": "XMLHttpRequest",
 }
-LOADER_MAX_SECONDS = 25
+LOADER_MAX_SECONDS = 20
 
 
 def loader_get(path, params, timeout=12):
@@ -67,7 +68,7 @@ def url_is_valid(url):
         return False
 
 
-# ---------- المشغل: loader.to ----------
+# ---------- المشغل 1: loader.to ----------
 def player_loader(q):
     yt_url = get_youtube_url(q)
     if not yt_url:
@@ -106,22 +107,69 @@ def player_loader(q):
     return None, "loader: timeout"
 
 
-# ---------- المسارات ----------
+# ---------- المشغل 2: ساوند كلاود ----------
+def player_soundcloud(q):
+    res = sc_player_resolve(q)
+    if res.get("error"):
+        return None, res["error"]
+    return {
+        "title": res["title"],
+        "url": res["audio_url"],
+        "duration": res["duration"],
+        "track_url": res.get("track_url", ""),
+        "source": "SoundCloud",
+    }, None
+
+
+# ---------- المشغل 3: تيك توك ----------
+def player_tiktok(q):
+    url = "https://tik-sand-two.vercel.app/tiktok?q=" + urllib.parse.quote(q)
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    d = r.json()
+    link = d.get("music_url")
+    if not link:
+        return None, "no music_url in response"
+    title = (d.get("title") or "").split("#")[0].strip()
+    if not title or len(title) > 100:
+        title = "TikTok Music"
+    return {
+        "title": title,
+        "url": link,
+        "duration": 0,
+        "author": d.get("author", ""),
+        "source": "TikTok",
+    }, None
+
+
+# الترتيب: Loader ثم SoundCloud ثم TikTok
+PLAYERS = [
+    ("Loader", player_loader),
+    ("SoundCloud", player_soundcloud),
+    ("TikTok", player_tiktok),
+]
+
+
 @app.route("/")
 def home():
-    return "OK"
+    return "Song API works. Use /api/song?q=name"
 
 
 @app.route("/api/song")
-@app.route("/play")
 def song():
-    q = (request.args.get("q") or "").strip()
+    q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"ok": False, "error": "missing q"}), 400
-    try:
-        result, err = player_loader(q)
-    except Exception as e:
-        return jsonify({"ok": False, "error": repr(e)}), 502
-    if not result:
-        return jsonify({"ok": False, "error": err}), 404
-    return jsonify({"ok": True, **result})
+    only = request.args.get("p", "").lower()
+    errors = {}
+    for name, fn in PLAYERS:
+        if only and only != name.lower():
+            continue
+        try:
+            res, err = fn(q)
+            if res:
+                return jsonify({"ok": True, **res})
+            errors[name] = err
+        except Exception as e:
+            errors[name] = repr(e)
+    return jsonify({"ok": False, "errors": errors}), 404
