@@ -79,7 +79,7 @@ def player_soundcloud(q):
     return None, "no direct audio found"
 
 
-PLAYERS = [("TikTok", player_tiktok), ("SoundCloud", player_soundcloud)]
+PLAYERS = [("SoundCloud", player_soundcloud), ("TikTok", player_tiktok)]
 
 
 @app.route("/")
