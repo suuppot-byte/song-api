@@ -1,48 +1,31 @@
-import re
 import urllib.parse
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-H = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-    "Referer": "https://jmnails.pl/",
-}
 
-
-def get_video_id(q):
-    m = re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", q)
-    if m:
-        return m.group(1)
-    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-    ids = re.findall(r"watch\?v=(\S{11})", r.text)
-    return ids[0] if ids else None
-
-
-def player_vip(q):
-    vid = get_video_id(q)
-    if not vid:
-        return None, "no video id"
-    title, duration = "Unknown", 0
-    try:
-        r = requests.get(f"https://v2.y2jar.cc/i/{vid}", headers=H, timeout=6)
-        d = r.json()
-        title = d.get("title", title)
-        duration = int(d.get("duration") or 0)
-    except Exception:
-        pass
-    r = requests.get(f"https://capi.y2jar.cc/scr/{vid}?s=5", headers=H, timeout=10)
+def player_tiktok(q):
+    url = "https://tik-sand-two.vercel.app/tiktok?q=" + urllib.parse.quote(q)
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
     d = r.json()
-    link = d.get("downloadUrl") or d.get("link") or d.get("url")
+    link = d.get("music_url")
     if not link:
-        return None, "no download link"
-    return {"title": title, "url": link, "duration": duration, "source": "VIP"}, None
+        return None, "no music_url in response"
+    title = (d.get("title") or "").split("#")[0].strip()
+    if not title or len(title) > 100:
+        title = "TikTok Music"
+    return {
+        "title": title,
+        "url": link,
+        "duration": 0,
+        "author": d.get("author", ""),
+        "source": "TikTok",
+    }, None
 
 
-PLAYERS = [("VIP", player_vip)]
+PLAYERS = [("TikTok", player_tiktok)]
 
 
 @app.route("/")
