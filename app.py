@@ -108,3 +108,20 @@ def player_loader(q):
     return None, "loader: timeout"
 
 # ---- أكمل باقي كودك من هنا (باقي المشغلات والـ routes) ----
+@app.route("/")
+def home():
+    return "OK"
+
+
+@app.route("/play")
+def play():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "missing q"}), 400
+    try:
+        result, err = player_loader(q)
+    except Exception as e:
+        return jsonify({"ok": False, "error": repr(e)}), 502
+    if not result:
+        return jsonify({"ok": False, "error": err}), 404
+    return jsonify({"ok": True, **result})
