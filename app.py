@@ -135,11 +135,13 @@ def player_loader(q):
                 except (ValueError, TypeError):
                     duration = 0
                 clean = rehost_audio(link)
+                if not clean:
+                    return None, "loader: rehost failed"
                 return {
                     "title": p.get("title") or q,
-                    "url": clean or link,
+                    "url": clean,
                     "original_url": link,
-                    "rehosted": bool(clean),
+                    "rehosted": True,
                     "duration": duration,
                     "track_url": yt_url,
                     "source": "Loader",
