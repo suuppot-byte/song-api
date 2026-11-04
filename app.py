@@ -166,8 +166,18 @@ def download():
     host = parsed.hostname or ""
     if parsed.scheme != "https" or not host.endswith("savenow.to"):
         return "bad url", 400
-    r = requests.get(u, stream=True, timeout=30,
-                     headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(u, stream=True, timeout=30, allow_redirects=False,
+                     headers={"User-Agent": "Mozilla/5.0",
+                              "Accept": "audio/*,*/*"})
+    if r.status_code in (301, 302, 303, 307, 308):
+        loc = r.headers.get("Location", "")
+        if not (urlparse(loc).hostname or "").endswith("savenow.to"):
+            return "redirected to ad page", 502
+        r = requests.get(loc, stream=True, timeout=30,
+                         headers={"User-Agent": "Mozilla/5.0"})
+    ctype = r.headers.get("Content-Type", "")
+    if "audio" not in ctype and "octet-stream" not in ctype:
+        return "not an audio file", 502
     headers = {
         "Content-Type": "audio/mpeg",
         "Content-Disposition":
