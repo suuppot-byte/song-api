@@ -1,10 +1,12 @@
 import re
 import time
 import urllib.parse
+from urllib.parse import urlparse, quote
+
 import requests
 import yt_dlp
 from curl_cffi import requests as cffi_requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from sc_player import sc_player_resolve
 
 app = Flask(__name__)
@@ -155,6 +157,27 @@ def home():
     return "Song API works. Use /api/song?q=name"
 
 
+# ---------- رابط وسيط يجبر المتصفح على التحميل ----------
+@app.route("/api/dl")
+def download():
+    u = request.args.get("u", "")
+    name = (request.args.get("n") or "song")[:80]
+    parsed = urlparse(u)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https" or not host.endswith("savenow.to"):
+        return "bad url", 400
+    r = requests.get(u, stream=True, timeout=30,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    headers = {
+        "Content-Type": "audio/mpeg",
+        "Content-Disposition":
+            "attachment; filename*=UTF-8''" + quote(name) + ".mp3",
+    }
+    if r.headers.get("Content-Length"):
+        headers["Content-Length"] = r.headers["Content-Length"]
+    return Response(r.iter_content(65536), headers=headers)
+
+
 @app.route("/api/song")
 def song():
     q = request.args.get("q", "").strip()
@@ -168,8 +191,17 @@ def song():
         try:
             res, err = fn(q)
             if res:
+                if res.get("source") == "Loader":
+                    res["download"] = (
+                        request.host_url.rstrip("/") + "/api/dl?" +
+                        urllib.parse.urlencode(
+                            {"u": res["url"], "n": res["title"]}))
                 return jsonify({"ok": True, **res})
             errors[name] = err
         except Exception as e:
             errors[name] = repr(e)
     return jsonify({"ok": False, "errors": errors}), 404
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
