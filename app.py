@@ -7,7 +7,9 @@ import requests
 import yt_dlp
 from curl_cffi import requests as cffi_requests
 from flask import Flask, request, jsonify, Response
-from sc_player import sc_player_resolve
+import os
+import uuid
+from sc_player import sc_player_resolve, sc_player_upload
 
 app = Flask(__name__)
 
@@ -70,6 +72,39 @@ def url_is_valid(url):
         return False
 
 
+
+# ---------- إعادة رفع الملف إلى رابط نظيف (بدون إعلانات) ----------
+REHOST_MAX_BYTES = 40 * 1024 * 1024
+
+
+def is_audio_bytes(b):
+    return b[:3] == b"ID3" or (len(b) > 1 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)
+
+
+def rehost_audio(link):
+    """يحمّل الـ MP3 من السيرفر ثم يرفعه إلى uguu ويرجع رابطاً مباشراً"""
+    path = f"/tmp/ld_{uuid.uuid4().hex[:8]}.mp3"
+    try:
+        r = cffi_requests.get(link, impersonate="chrome", timeout=40,
+                              headers={"Accept": "audio/*,*/*"})
+        if r.status_code != 200:
+            return None
+        data = r.content
+        if len(data) > REHOST_MAX_BYTES or not is_audio_bytes(data):
+            return None
+        with open(path, "wb") as f:
+            f.write(data)
+        return sc_player_upload(path)
+    except Exception as e:
+        print("[REHOST]", repr(e))
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 # ---------- المشغل 1: loader.to ----------
 def player_loader(q):
     yt_url = get_youtube_url(q)
@@ -99,9 +134,12 @@ def player_loader(q):
                     duration = int(p.get("duration") or 0)
                 except (ValueError, TypeError):
                     duration = 0
+                clean = rehost_audio(link)
                 return {
                     "title": p.get("title") or q,
-                    "url": link,
+                    "url": clean or link,
+                    "original_url": link,
+                    "rehosted": bool(clean),
                     "duration": duration,
                     "track_url": yt_url,
                     "source": "Loader",
@@ -201,7 +239,7 @@ def song():
         try:
             res, err = fn(q)
             if res:
-                if res.get("source") == "Loader":
+                if res.get("source") == "Loader" and not res.get("rehosted"):
                     res["download"] = (
                         request.host_url.rstrip("/") + "/api/dl?" +
                         urllib.parse.urlencode(
