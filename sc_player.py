@@ -398,7 +398,32 @@ def sc_player_pick_direct(formats):
             continue
         if best is None or pref[f["ext"]] < pref[best["ext"]]:
             best = f
-    return best["url"] if best else None
+    return best
+
+
+def sc_player_rehost_direct(fmt, base, deadline=None):
+    """رابط ساوند كلاود المباشر مؤقت: ننزّله ونرفعه إلى uguu"""
+    path = f"{base}.{fmt.get('ext') or 'mp3'}"
+    try:
+        size = 0
+        with requests.get(fmt["url"], stream=True, headers=SC_UA, timeout=30) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(65536):
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > SC_MAX_BYTES or (deadline and time.time() > deadline):
+                        return None
+                    f.write(chunk)
+        if size < 20000:
+            return None
+        left = int(deadline - time.time()) if deadline else 120
+        return sc_player_upload(path, tries=1 if size > 40 * 1024 * 1024 else 2,
+                                timeout=max(20, left))
+    except Exception as e:
+        print(f"[SC_PLAYER] ⚠️ rehost: {e!r}")
+        return None
 
 
 def sc_player_upload(path, tries=2, timeout=120):
@@ -433,7 +458,10 @@ def sc_player_resolve(query, deadline=None):
 
             direct = sc_player_pick_direct(formats)
             if direct:
-                return {"title": title, "track_url": track_url, "audio_url": direct,
+                hosted = sc_player_rehost_direct(direct, base, deadline)
+                return {"title": title, "track_url": track_url,
+                        "audio_url": hosted or direct["url"],
+                        "rehosted": bool(hosted),
                         "duration": duration, "source": "SoundCloud"}
 
             got = sc_player_hls_audio(formats, duration, base)
@@ -442,6 +470,7 @@ def sc_player_resolve(query, deadline=None):
                 url = sc_player_upload(path)
                 if url:
                     return {"title": title, "track_url": track_url, "audio_url": url,
+                            "rehosted": True,
                             "duration": duration, "source": "SoundCloud"}
         return {"error": "No results found."}
     except Exception as e:
