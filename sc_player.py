@@ -401,12 +401,12 @@ def sc_player_pick_direct(formats):
     return best["url"] if best else None
 
 
-def sc_player_upload(path):
-    for _ in range(2):
+def sc_player_upload(path, tries=2, timeout=120):
+    for _ in range(tries):
         try:
             with open(path, "rb") as f:
                 r = requests.post("https://uguu.se/upload.php",
-                                  files={"files[]": f}, headers=SC_UA, timeout=120)
+                                  files={"files[]": f}, headers=SC_UA, timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
                 if data.get("success"):
