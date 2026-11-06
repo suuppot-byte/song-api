@@ -6,7 +6,7 @@ from urllib.parse import urlparse, quote
 import requests
 import yt_dlp
 from curl_cffi import requests as cffi_requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, g
 import os
 import uuid
 from sc_player import sc_player_resolve, sc_player_upload
@@ -20,7 +20,13 @@ LOADER_HEADERS = {
     "Referer": LOADER + "/",
     "X-Requested-With": "XMLHttpRequest",
 }
-LOADER_MAX_SECONDS = 20
+# الميزانية الكلية للطلب (ثواني) — لازم تكون أقل من maxDuration في vercel.json
+TOTAL_BUDGET = int(os.environ.get("TOTAL_BUDGET", "270"))
+RESERVE = 12  # وقت احتياطي لإعادة الرفع والرد
+
+
+def time_left():
+    return getattr(g, "deadline", time.time() + TOTAL_BUDGET) - time.time()
 
 
 def loader_get(path, params, timeout=12):
@@ -75,6 +81,16 @@ def url_is_valid(url):
 
 # ---------- إعادة رفع الملف إلى رابط نظيف (بدون إعلانات) ----------
 REHOST_MAX_BYTES = 40 * 1024 * 1024
+REHOST_MAX_SECONDS = 30 * 60  # أطول من هذا لا نعيد رفعه، نرجع الرابط المباشر
+
+
+def remote_size(link):
+    try:
+        r = cffi_requests.head(link, impersonate="chrome", timeout=8,
+                               allow_redirects=True)
+        return int(r.headers.get("Content-Length") or 0)
+    except Exception:
+        return 0
 
 
 def is_audio_bytes(b):
@@ -85,7 +101,8 @@ def rehost_audio(link):
     """يحمّل الـ MP3 من السيرفر ثم يرفعه إلى uguu ويرجع رابطاً مباشراً"""
     path = f"/tmp/ld_{uuid.uuid4().hex[:8]}.mp3"
     try:
-        r = cffi_requests.get(link, impersonate="chrome", timeout=40,
+        r = cffi_requests.get(link, impersonate="chrome",
+                              timeout=max(10, min(40, int(time_left()) - 5)),
                               headers={"Accept": "audio/*,*/*"})
         if r.status_code != 200:
             return None
@@ -120,38 +137,45 @@ def player_loader(q):
     if not job_id:
         return None, "loader: no job id"
 
-    start = time.time()
-    while time.time() - start < LOADER_MAX_SECONDS:
+    while time_left() > RESERVE:
         time.sleep(2)
-        pr = loader_get("/ajax/progress.php", {"id": job_id}, timeout=10)
-        if pr.status_code != 200:
+        try:
+            pr = loader_get("/ajax/progress.php", {"id": job_id}, timeout=10)
+            if pr.status_code != 200:
+                continue
+            p = pr.json()
+        except Exception:
             continue
-        p = pr.json()
         if p.get("success") == 1:
             link = p.get("download_url")
-            if url_is_valid(link):
-                try:
-                    duration = int(p.get("duration") or 0)
-                except (ValueError, TypeError):
-                    duration = 0
-                clean = rehost_audio(link)
-                if not clean:
-                    return None, "loader: rehost failed"
-                return {
-                    "title": p.get("title") or q,
-                    "url": clean,
-                    "original_url": link,
-                    "rehosted": True,
-                    "duration": duration,
-                    "track_url": yt_url,
-                    "source": "Loader",
-                }, None
+            if not url_is_valid(link):
+                continue
+            try:
+                duration = int(p.get("duration") or 0)
+            except (ValueError, TypeError):
+                duration = 0
+            size = remote_size(link)
+            small = (size and size <= REHOST_MAX_BYTES) or \
+                    (not size and 0 < duration <= REHOST_MAX_SECONDS)
+            clean = rehost_audio(link) if (small and time_left() > 20) else None
+            res = {
+                "title": p.get("title") or q,
+                "duration": duration,
+                "track_url": yt_url,
+                "source": "Loader",
+                "size": size,
+            }
+            if clean:
+                res.update(url=clean, original_url=link, rehosted=True)
+            else:  # ملف طويل/كبير: نرجع الرابط المباشر بدل الفشل
+                res.update(url=link, rehosted=False)
+            return res, None
     return None, "loader: timeout"
 
 
 # ---------- المشغل 2: ساوند كلاود ----------
 def player_soundcloud(q):
-    res = sc_player_resolve(q)
+    res = sc_player_resolve(q, deadline=time.time() + max(5, time_left() - 5))
     if res.get("error"):
         return None, res["error"]
     return {
@@ -234,9 +258,13 @@ def song():
     if not q:
         return jsonify({"ok": False, "error": "missing q"}), 400
     only = request.args.get("p", "").lower()
+    g.deadline = time.time() + TOTAL_BUDGET
     errors = {}
     for name, fn in PLAYERS:
         if only and only != name.lower():
+            continue
+        if time_left() < 5:
+            errors[name] = "skipped: out of time"
             continue
         try:
             res, err = fn(q)
