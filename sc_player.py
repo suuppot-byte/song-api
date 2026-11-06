@@ -307,6 +307,10 @@ def sc_player_hls_audio(formats, duration, base):
                     seg_urls.append(_urljoin(fmt["url"], l))
             if not seg_urls or (duration > 0 and total < duration * 0.8):
                 continue
+            # تقدير الحجم قبل التحميل (≈160kbps) — لا نضيع الوقت على ملف طويل
+            if total * 20000 > SC_MAX_BYTES:
+                print(f"[SC_PLAYER] too long for HLS ({int(total)}s)")
+                continue
 
             with ThreadPoolExecutor(max_workers=8) as pool:
                 init = pool.submit(_sc_fetch, init_url) if init_url else None
@@ -413,10 +417,12 @@ def sc_player_upload(path):
     return None
 
 
-def sc_player_resolve(query):
+def sc_player_resolve(query, deadline=None):
     base = f"/tmp/temp_sc_{uuid.uuid4().hex[:8]}"
     try:
         for info in sc_player_infos(query):
+            if deadline and time.time() > deadline:
+                break
             title = info.get("title", "Unknown")
             track_url = info.get("webpage_url")
             try:
