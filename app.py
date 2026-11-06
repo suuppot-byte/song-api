@@ -5,20 +5,12 @@ from urllib.parse import urlparse, quote
 import requests
 import yt_dlp
 from curl_cffi import requests as cffi_requests
-from flask import Flask, request, jsonify, Response, send_file
+from flask import Flask, request, jsonify, Response
 import os
 import uuid
-import threading
-from sc_player import sc_player_resolve, check_url_alive, cleanup_old_files
+from sc_player import sc_player_resolve, sc_player_upload
 
 app = Flask(__name__)
-
-# ✅ تنظيف تلقائي كل ساعة
-def auto_cleanup():
-    while True:
-        time.sleep(3600)
-        cleanup_old_files()
-threading.Thread(target=auto_cleanup, daemon=True).start()
 
 LOADER = "https://loader.to"
 LOADER_HEADERS = {
@@ -53,55 +45,111 @@ def get_youtube_url(q):
     except Exception: pass
     return None
 
-# ✅ حذف rehost_audio - إرجاع الرابط مباشرة بعد الفحص
+def url_is_valid(url):
+    if not url or not url.startswith("http"): return False
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        return r.status_code in (200, 206, 302)
+    except Exception:
+        return False
+
+# ✅ إرجاع rehost_audio مع زيادة الحد
+REHOST_MAX_BYTES = 200 * 1024 * 1024  # ⚡ 200MB بدلاً من 40MB
+
+def is_audio_bytes(b):
+    return b[:3] == b"ID3" or (len(b) > 1 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)
+
+def rehost_audio(link):
+    """يحمّل الـ MP3 ثم يرفعه إلى uguu.se"""
+    path = f"/tmp/ld_{uuid.uuid4().hex[:8]}.mp3"
+    try:
+        print(f"[REHOST] 📥 Downloading from loader.to...")
+        r = cffi_requests.get(link, impersonate="chrome", timeout=60,
+                             headers={"Accept": "audio/*, */*"})
+        if r.status_code != 200:
+            print(f"[REHOST] ❌ Download failed: {r.status_code}")
+            return None
+        
+        data = r.content
+        print(f"[REHOST] 📊 Size: {len(data) / (1024*1024):.1f}MB")
+        
+        if len(data) > REHOST_MAX_BYTES:
+            print(f"[REHOST] ❌ Too large: {len(data)} bytes")
+            return None
+        
+        if not is_audio_bytes(data):
+            print(f"[REHOST] ❌ Not audio")
+            return None
+        
+        with open(path, "wb") as f:
+            f.write(data)
+        
+        print(f"[REHOST] 📤 Uploading to uguu.se...")
+        return sc_player_upload(path)
+    except Exception as e:
+        print(f"[REHOST] ❌ {e!r}")
+        return None
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
 def player_loader(q):
     yt_url = get_youtube_url(q)
     if not yt_url: return None, "youtube: no results"
+    
+    print(f"[LOADER] 🎵 Processing: {q}")
     r = loader_get("/ajax/download.php", {"format": "mp3", "url": yt_url})
     r.raise_for_status()
     data = r.json()
-    if data.get("success") not in (True, 1): return None, "loader: request rejected"
+    
+    if data.get("success") not in (True, 1):
+        return None, "loader: request rejected"
+    
     job_id = data.get("id")
     if not job_id: return None, "loader: no job id"
+    
     start = time.time()
     while time.time() - start < LOADER_MAX_SECONDS:
         time.sleep(2)
         pr = loader_get("/ajax/progress.php", {"id": job_id}, timeout=10)
         if pr.status_code != 200: continue
+        
         p = pr.json()
         if p.get("success") == 1:
             link = p.get("download_url")
-            # ✅ فحص الرابط بدلاً من إعادة الرفع
-            if link and check_url_alive(link):
+            print(f"[LOADER] ✅ Got download URL")
+            
+            if url_is_valid(link):
                 try: duration = int(p.get("duration") or 0)
                 except (ValueError, TypeError): duration = 0
+                
+                clean = rehost_audio(link)
+                if not clean:
+                    return None, "loader: rehost failed"
+                
                 return {
                     "title": p.get("title") or q,
-                    "url": link,
+                    "url": clean,
+                    "original_url": link,
+                    "rehosted": True,
                     "duration": duration,
                     "track_url": yt_url,
                     "source": "Loader",
                 }, None
+    
     return None, "loader: timeout"
 
 def player_soundcloud(q):
     res = sc_player_resolve(q)
     if res.get("error"): return None, res["error"]
-    result = {
+    return {
         "title": res["title"],
+        "url": res["audio_url"],
         "duration": res["duration"],
         "track_url": res.get("track_url", ""),
         "source": "SoundCloud",
-    }
-    if res.get("local_file"):
-        # ✅ إرجاع مسار محلي ليتم تقديمه عبر /api/stream
-        filename = os.path.basename(res["local_file"])
-        result["url"] = f"/api/stream/{filename}"
-        result["local"] = True
-    else:
-        result["url"] = res["audio_url"]
-        result["local"] = False
-    return result, None
+    }, None
 
 def player_tiktok(q):
     url = "https://tik-sand-two.vercel.app/tiktok?q=" + urllib.parse.quote(q)
@@ -122,17 +170,6 @@ PLAYERS = [("Loader", player_loader), ("SoundCloud", player_soundcloud), ("TikTo
 @app.route("/")
 def home():
     return "Song API works. Use /api/song?q=name"
-
-# ✅ endpoint جديد لتقديم الملفات المحلية
-@app.route("/api/stream/<filename>")
-def stream_file(filename):
-    # حماية من path traversal
-    if ".." in filename or "/" in filename:
-        return "Invalid filename", 400
-    filepath = f"/tmp/{filename}"
-    if not os.path.exists(filepath):
-        return "File not found", 404
-    return send_file(filepath, as_attachment=True, download_name=filename)
 
 @app.route("/api/dl")
 def download():
@@ -171,6 +208,10 @@ def song():
         try:
             res, err = fn(q)
             if res:
+                if res.get("source") == "Loader" and not res.get("rehosted"):
+                    res["download"] = (
+                        request.host_url.rstrip("/") + "/api/dl?" +
+                        urllib.parse.urlencode({"u": res["url"], "n": res["title"]}))
                 return jsonify({"ok": True, **res})
             errors[name] = err
         except Exception as e:
