@@ -9,6 +9,8 @@ import yt_dlp
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin as _urljoin
 
+# ✅ زيادة الحد إلى 200MB للأغاني الطويلة
+SC_MAX_BYTES = 200 * 1024 * 1024
 SC_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; WinV64; x64) AppleWebKit/537.36"}
 
 def _mp4_boxes(data, start=0, end=None):
@@ -205,15 +207,15 @@ def sc_ts_to_aac(segments):
                 out += payload
     return bytes(out)
 
-def _sc_fetch(url, tries=2):
+def _sc_fetch(url, tries=3):
     for i in range(tries):
         try:
-            r = requests.get(url, headers=SC_UA, timeout=15)
+            r = requests.get(url, headers=SC_UA, timeout=30)
             r.raise_for_status()
             return r.content
         except Exception:
             if i == tries - 1: raise
-            time.sleep(0.5)
+            time.sleep(1)
 
 def sc_player_hls_audio(formats, duration, base):
     def is_preview(f):
@@ -247,11 +249,13 @@ def sc_player_hls_audio(formats, duration, base):
                     seg_urls.append(_urljoin(fmt["url"], l))
             if not seg_urls or (duration > 0 and total < duration * 0.8): continue
             
-            # ⚡ تسريع: 32 worker بدلاً من 8
+            # ⚡ تسريع: 32 worker
             with ThreadPoolExecutor(max_workers=32) as pool:
                 init = pool.submit(_sc_fetch, init_url) if init_url else None
                 segs = list(pool.map(_sc_fetch, seg_urls))
                 init_data = init.result() if init else None
+            
+            if sum(len(s) for s in segs) > SC_MAX_BYTES: continue
             
             first = segs[0]
             if init_data is not None:
@@ -279,7 +283,7 @@ def sc_player_search(query):
     if not query: return None, "No search query provided."
     try:
         data = requests.get("https://m.soundcloud.com/search",
-                           params={"q": query}, headers=SC_UA, timeout=10)
+                           params={"q": query}, headers=SC_UA, timeout=15)
         urls = re.findall(r'data-testid="cell-entity-link" href="([^"]+)', data.text)
     except Exception as e:
         return None, f"Search failed: {e}"
@@ -287,7 +291,7 @@ def sc_player_search(query):
     return f"https://soundcloud.com{urls[0]}", None
 
 def sc_player_infos(query):
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 10}
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 15}
     seen = set()
     url, _err = sc_player_search(query)
     if url:
@@ -323,14 +327,27 @@ def sc_player_pick_direct(formats):
             best = f
     return best["url"] if best else None
 
-# ✅ فحص سريع للرابط
-def check_url_alive(url, timeout=5):
-    try:
-        r = requests.head(url, timeout=timeout, allow_redirects=True, 
-                         headers=SC_UA, stream=True)
-        return r.status_code in (200, 206, 302)
-    except Exception:
-        return False
+# ✅ إرجاع رفع uguu.se مع تحسينات
+def sc_player_upload(path):
+    for attempt in range(3):
+        try:
+            file_size = os.path.getsize(path)
+            print(f"[SC_PLAYER] 📤 Uploading {file_size / (1024*1024):.1f}MB to uguu.se (attempt {attempt+1})")
+            
+            with open(path, "rb") as f:
+                r = requests.post("https://uguu.se/upload.php",
+                                files={"files[]": f}, headers=SC_UA, timeout=180)
+            
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("success"):
+                    url = data["files"][0]["url"]
+                    print(f"[SC_PLAYER] ✅ Uploaded: {url}")
+                    return url
+        except Exception as e:
+            print(f"[SC_PLAYER] ⚠️ upload attempt {attempt+1}: {e!r}")
+            time.sleep(2)
+    return None
 
 def sc_player_resolve(query):
     base = f"/tmp/temp_sc_{uuid.uuid4().hex[:8]}"
@@ -342,32 +359,23 @@ def sc_player_resolve(query):
             except (ValueError, TypeError): duration = 0
             formats = [f for f in info.get("formats", []) if f.get("url")]
             
-            # ✅ أولاً: البحث عن رابط مباشر
             direct = sc_player_pick_direct(formats)
-            if direct and check_url_alive(direct):
+            if direct:
                 return {"title": title, "track_url": track_url, "audio_url": direct,
-                        "duration": duration, "source": "SoundCloud", "local_file": None}
+                        "duration": duration, "source": "SoundCloud"}
             
-            # ✅ ثانياً: HLS → حفظ محلي (بدون رفع)
             got = sc_player_hls_audio(formats, duration, base)
             if got:
                 path, ext = got
-                return {"title": title, "track_url": track_url, "audio_url": None,
-                        "duration": duration, "source": "SoundCloud", "local_file": path}
+                url = sc_player_upload(path)
+                if url:
+                    return {"title": title, "track_url": track_url, "audio_url": url,
+                            "duration": duration, "source": "SoundCloud"}
         return {"error": "No results found."}
     except Exception as e:
         print(f"[SC_PLAYER] ❌ {e!r}")
         return {"error": str(e)}
     finally:
-        # ⚠️ لا تحذف الملفات الآن - سيتم تقديمها عبر /api/stream
-        pass
-
-# ✅ دالة لتنظيف الملفات القديمة
-def cleanup_old_files(max_age_hours=2):
-    now = time.time()
-    for f in _glob.glob("/tmp/temp_sc_*"):
-        try:
-            if now - os.path.getmtime(f) > max_age_hours * 3600:
-                os.remove(f)
-        except OSError:
-            pass
+        for f in _glob.glob(base + "*"):
+            try: os.remove(f)
+            except OSError: pass
