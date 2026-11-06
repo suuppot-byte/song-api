@@ -21,7 +21,7 @@ LOADER_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 # الميزانية الكلية للطلب (ثواني) — لازم تكون أقل من maxDuration في vercel.json
-TOTAL_BUDGET = int(os.environ.get("TOTAL_BUDGET", "270"))
+TOTAL_BUDGET = int(os.environ.get("TOTAL_BUDGET", "85"))
 RESERVE = 12  # وقت احتياطي لإعادة الرفع والرد
 
 
@@ -80,8 +80,8 @@ def url_is_valid(url):
 
 
 # ---------- إعادة رفع الملف إلى رابط نظيف (بدون إعلانات) ----------
-REHOST_MAX_BYTES = 40 * 1024 * 1024
-REHOST_MAX_SECONDS = 30 * 60  # أطول من هذا لا نعيد رفعه، نرجع الرابط المباشر
+REHOST_MAX_BYTES = 120 * 1024 * 1024  # حد uguu تقريباً 128MB
+REHOST_MAX_SECONDS = 2 * 3600  # ≈115MB بجودة 128kbps
 
 
 def remote_size(link):
@@ -111,7 +111,8 @@ def rehost_audio(link):
             return None
         with open(path, "wb") as f:
             f.write(data)
-        return sc_player_upload(path)
+        return sc_player_upload(path, tries=1 if len(data) > 40 * 1024 * 1024 else 2,
+                                timeout=max(20, int(time_left()) - 3))
     except Exception as e:
         print("[REHOST]", repr(e))
         return None
@@ -157,7 +158,7 @@ def player_loader(q):
             size = remote_size(link)
             small = (size and size <= REHOST_MAX_BYTES) or \
                     (not size and 0 < duration <= REHOST_MAX_SECONDS)
-            clean = rehost_audio(link) if (small and time_left() > 20) else None
+            clean = rehost_audio(link) if (small and time_left() > 15) else None
             res = {
                 "title": p.get("title") or q,
                 "duration": duration,
@@ -167,8 +168,10 @@ def player_loader(q):
             }
             if clean:
                 res.update(url=clean, original_url=link, rehosted=True)
-            else:  # ملف طويل/كبير: نرجع الرابط المباشر بدل الفشل
-                res.update(url=link, rehosted=False)
+            else:  # فشلت إعادة الرفع: نمرّر الملف عبر السيرفر (بدون إعلانات)
+                proxy = (request.host_url.rstrip("/") + "/api/dl?" +
+                         urllib.parse.urlencode({"u": link, "n": res["title"]}))
+                res.update(url=proxy, original_url=link, rehosted=False)
             return res, None
     return None, "loader: timeout"
 
@@ -230,15 +233,8 @@ def download():
     host = parsed.hostname or ""
     if parsed.scheme != "https" or not host.endswith("savenow.to"):
         return "bad url", 400
-    r = requests.get(u, stream=True, timeout=30, allow_redirects=False,
-                     headers={"User-Agent": "Mozilla/5.0",
-                              "Accept": "audio/*,*/*"})
-    if r.status_code in (301, 302, 303, 307, 308):
-        loc = r.headers.get("Location", "")
-        if not (urlparse(loc).hostname or "").endswith("savenow.to"):
-            return "redirected to ad page", 502
-        r = requests.get(loc, stream=True, timeout=30,
-                         headers={"User-Agent": "Mozilla/5.0"})
+    r = cffi_requests.get(u, stream=True, impersonate="chrome", timeout=60,
+                          headers={"Accept": "audio/*,*/*"})
     ctype = r.headers.get("Content-Type", "")
     if "audio" not in ctype and "octet-stream" not in ctype:
         return "not an audio file", 502
