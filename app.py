@@ -9,7 +9,7 @@ from curl_cffi import requests as cffi_requests
 from flask import Flask, request, jsonify, Response, g
 import os
 import uuid
-from sc_player import sc_player_resolve, sc_player_upload
+from sc_player import sc_player_resolve
 
 app = Flask(__name__)
 
@@ -79,60 +79,29 @@ def url_is_valid(url):
 
 
 
-# ---------- إعادة رفع الملف إلى رابط نظيف (بدون إعلانات) ----------
-REHOST_MAX_BYTES = 120 * 1024 * 1024  # حد uguu تقريباً 128MB
-REHOST_MAX_SECONDS = 2 * 3600  # ≈115MB بجودة 128kbps
-
-
-def remote_size(link):
+# ---------- فحص الرابط: هل هو ملف صوت فعلاً؟ ----------
+def link_ok(url, impersonate=False):
+    """يجلب أول جزء من الملف ويتأكد أنه صوت وليس صفحة (إعلانات/خطأ)"""
+    if not url or not url.startswith("http"):
+        return False
     try:
-        r = cffi_requests.head(link, impersonate="chrome", timeout=8,
-                               allow_redirects=True)
-        return int(r.headers.get("Content-Length") or 0)
-    except Exception:
-        return 0
-
-
-def is_audio_bytes(b):
-    return b[:3] == b"ID3" or (len(b) > 1 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)
-
-
-def rehost_audio(link):
-    """يحمّل الـ MP3 (بالتدفق) ثم يرفعه إلى uguu ويرجع رابطاً مباشراً"""
-    path = f"/tmp/ld_{uuid.uuid4().hex[:8]}.mp3"
-    try:
-        # نترك للرفع نصف الوقت المتبقي تقريباً
-        dl_deadline = time.time() + max(15, time_left() * 0.5)
-        r = cffi_requests.get(link, impersonate="chrome", stream=True,
-                              timeout=60, headers={"Accept": "audio/*,*/*"})
-        if r.status_code != 200:
-            return None
-        total, first = 0, True
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(65536):
-                if not chunk:
-                    continue
-                if first:
-                    if not is_audio_bytes(chunk):
-                        return None  # صفحة إعلانات وليست صوت
-                    first = False
-                total += len(chunk)
-                if total > REHOST_MAX_BYTES or time.time() > dl_deadline:
-                    print("[REHOST] too big or too slow", total)
-                    return None
-                f.write(chunk)
-        if total == 0:
-            return None
-        return sc_player_upload(path, tries=1 if total > 40 * 1024 * 1024 else 2,
-                                timeout=max(20, int(time_left()) - 3))
+        if impersonate:
+            r = cffi_requests.get(url, impersonate="chrome", stream=True, timeout=15,
+                                  headers={"Accept": "audio/*,*/*"})
+        else:
+            r = requests.get(url, stream=True, timeout=15,
+                             headers={"User-Agent": "Mozilla/5.0", "Accept": "audio/*,*/*"})
+        if r.status_code not in (200, 206):
+            return False
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype or "json" in ctype:
+            return False
+        chunk = next(r.iter_content(2048), b"")
+        r.close()
+        return len(chunk) > 0 and chunk.lstrip()[:1] != b"<"
     except Exception as e:
-        print("[REHOST]", repr(e))
-        return None
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        print("[LINK_CHECK]", repr(e))
+        return False
 
 
 # ---------- المشغل 1: loader.to ----------
@@ -167,28 +136,21 @@ def player_loader(q):
                 duration = int(p.get("duration") or 0)
             except (ValueError, TypeError):
                 duration = 0
-            size = remote_size(link)
-            # الحجم/المدة قد تكون 0 (غير معروفة): نجرب إعادة الرفع، والتحميل نفسه يوقف عند الحد
-            if size:
-                small = size <= REHOST_MAX_BYTES
-            elif duration:
-                small = duration <= REHOST_MAX_SECONDS
-            else:
-                small = True
-            clean = rehost_audio(link) if (small and time_left() > 15) else None
+            # فحص: هل الرابط الأصلي ملف صوت فعلاً (بنفس طريقة /api/dl)
+            if not link_ok(link, impersonate=True):
+                return None, "loader: link check failed"
+            title = p.get("title") or q
+            proxy = (request.host_url.rstrip("/") + "/api/dl?" +
+                     urllib.parse.urlencode({"u": link, "n": title}))
             res = {
-                "title": p.get("title") or q,
+                "title": title,
+                "url": proxy,
+                "original_url": link,
+                "rehosted": False,
                 "duration": duration,
                 "track_url": yt_url,
                 "source": "Loader",
-                "size": size,
             }
-            if clean:
-                res.update(url=clean, original_url=link, rehosted=True)
-            else:  # فشلت إعادة الرفع: نمرّر الملف عبر السيرفر (بدون إعلانات)
-                proxy = (request.host_url.rstrip("/") + "/api/dl?" +
-                         urllib.parse.urlencode({"u": link, "n": res["title"]}))
-                res.update(url=proxy, original_url=link, rehosted=False)
             return res, None
     return None, "loader: timeout"
 
@@ -198,9 +160,12 @@ def player_soundcloud(q):
     res = sc_player_resolve(q, deadline=time.time() + max(5, time_left() - 5))
     if res.get("error"):
         return None, res["error"]
+    if not link_ok(res["audio_url"]):
+        return None, "soundcloud: link check failed"
     return {
         "title": res["title"],
         "url": res["audio_url"],
+        "rehosted": res.get("rehosted", False),
         "duration": res["duration"],
         "track_url": res.get("track_url", ""),
         "source": "SoundCloud",
@@ -282,11 +247,6 @@ def song():
         try:
             res, err = fn(q)
             if res:
-                if res.get("source") == "Loader" and not res.get("rehosted") and "/api/dl?" not in res["url"]:
-                    res["download"] = (
-                        request.host_url.rstrip("/") + "/api/dl?" +
-                        urllib.parse.urlencode(
-                            {"u": res["url"], "n": res["title"]}))
                 return jsonify({"ok": True, **res})
             errors[name] = err
         except Exception as e:
