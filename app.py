@@ -98,20 +98,32 @@ def is_audio_bytes(b):
 
 
 def rehost_audio(link):
-    """يحمّل الـ MP3 من السيرفر ثم يرفعه إلى uguu ويرجع رابطاً مباشراً"""
+    """يحمّل الـ MP3 (بالتدفق) ثم يرفعه إلى uguu ويرجع رابطاً مباشراً"""
     path = f"/tmp/ld_{uuid.uuid4().hex[:8]}.mp3"
     try:
-        r = cffi_requests.get(link, impersonate="chrome",
-                              timeout=max(10, min(40, int(time_left()) - 5)),
-                              headers={"Accept": "audio/*,*/*"})
+        # نترك للرفع نصف الوقت المتبقي تقريباً
+        dl_deadline = time.time() + max(15, time_left() * 0.5)
+        r = cffi_requests.get(link, impersonate="chrome", stream=True,
+                              timeout=60, headers={"Accept": "audio/*,*/*"})
         if r.status_code != 200:
             return None
-        data = r.content
-        if len(data) > REHOST_MAX_BYTES or not is_audio_bytes(data):
-            return None
+        total, first = 0, True
         with open(path, "wb") as f:
-            f.write(data)
-        return sc_player_upload(path, tries=1 if len(data) > 40 * 1024 * 1024 else 2,
+            for chunk in r.iter_content(65536):
+                if not chunk:
+                    continue
+                if first:
+                    if not is_audio_bytes(chunk):
+                        return None  # صفحة إعلانات وليست صوت
+                    first = False
+                total += len(chunk)
+                if total > REHOST_MAX_BYTES or time.time() > dl_deadline:
+                    print("[REHOST] too big or too slow", total)
+                    return None
+                f.write(chunk)
+        if total == 0:
+            return None
+        return sc_player_upload(path, tries=1 if total > 40 * 1024 * 1024 else 2,
                                 timeout=max(20, int(time_left()) - 3))
     except Exception as e:
         print("[REHOST]", repr(e))
@@ -156,8 +168,13 @@ def player_loader(q):
             except (ValueError, TypeError):
                 duration = 0
             size = remote_size(link)
-            small = (size and size <= REHOST_MAX_BYTES) or \
-                    (not size and 0 < duration <= REHOST_MAX_SECONDS)
+            # الحجم/المدة قد تكون 0 (غير معروفة): نجرب إعادة الرفع، والتحميل نفسه يوقف عند الحد
+            if size:
+                small = size <= REHOST_MAX_BYTES
+            elif duration:
+                small = duration <= REHOST_MAX_SECONDS
+            else:
+                small = True
             clean = rehost_audio(link) if (small and time_left() > 15) else None
             res = {
                 "title": p.get("title") or q,
@@ -265,7 +282,7 @@ def song():
         try:
             res, err = fn(q)
             if res:
-                if res.get("source") == "Loader" and not res.get("rehosted"):
+                if res.get("source") == "Loader" and not res.get("rehosted") and "/api/dl?" not in res["url"]:
                     res["download"] = (
                         request.host_url.rstrip("/") + "/api/dl?" +
                         urllib.parse.urlencode(
